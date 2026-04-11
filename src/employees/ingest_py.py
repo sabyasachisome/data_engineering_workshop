@@ -8,6 +8,8 @@ from datetime import datetime
 import time
 import configparser
 import os
+import re
+import pyarrow
 
 # -----------------------------
 # AWS REGION
@@ -23,8 +25,11 @@ config.read("config.ini")
 # -----------------------------
 # LOGGING SETUP
 # -----------------------------
+source_name= config["DATADETAILS"]["source"]
+bucket_name= config["DATADETAILS"]["bucket_name"]
+
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_stream = f"test_pipeline_{timestamp}"
+log_stream = f"{source_name}_pipeline_{timestamp}"
 log_group = "data_engineering"
 
 logger = logging.getLogger(log_stream)
@@ -38,6 +43,12 @@ logger.addHandler(
 )
 
 logger.info("Pipeline started")
+
+# -----------------------------
+# s3 client
+# -----------------------------
+
+s3_client= boto3.client('s3')
 
 # -----------------------------
 # SFTP CONFIG
@@ -69,11 +80,11 @@ sftp = paramiko.SFTPClient.from_transport(transport)
 
 logger.info("Connected to SFTP")
 
-# -----------------------------
-# MYSQL CONNECTION (reuse)
-# -----------------------------
-conn = pymysql.connect(**db_config)
-cursor = conn.cursor()
+# # -----------------------------
+# # MYSQL CONNECTION (reuse)
+# # -----------------------------
+# conn = pymysql.connect(**db_config)
+# cursor = conn.cursor()
 
 # -----------------------------
 # DOWNLOAD + PROCESS FILES
@@ -90,25 +101,51 @@ for file in files:
             sftp.get(remote_path, local_path)
 
             # -----------------------------
-            # LOAD INTO MYSQL
+            # EXTRACT DATE FROM FILENAME
+            # -----------------------------
+            match = re.search(r'(\d{8})', file)
+            if not match:
+                raise ValueError(f"No date found in filename {file}")
+
+            date_str = match.group(1)  # 20260409
+            src_date = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+
+            logger.info(f"Extracted src_date: {src_date}")
+
+            # -----------------------------
+            # READ CSV
             # -----------------------------
             df = pd.read_csv(local_path)
 
-            for _, row in df.iterrows():
-                cursor.execute(
-                    "INSERT INTO employees (id, name, salary) VALUES (%s, %s, %s)",
-                    (row['id'], row['name'], row['salary'])
-                )
+            # -----------------------------
+            # CONVERT TO PARQUET
+            # -----------------------------
+            parquet_file = local_path.replace(".csv", ".parquet")
+            df.to_parquet(parquet_file, index=False)
 
-            conn.commit()
-
-            logger.info(f"Inserted {file}")
+            logger.info(f"Converted to parquet: {parquet_file}")
 
             # -----------------------------
-            # DELETE LOCAL FILE ✅
+            # BUILD S3 KEY (PARTITIONED)
+            # -----------------------------
+            s3_key = f"{source_name}/src_date={src_date}/{os.path.basename(parquet_file)}"
+
+            logger.info(f"Uploading to S3: {s3_key}")
+
+            # -----------------------------
+            # UPLOAD TO S3
+            # -----------------------------
+            s3_client.upload_file(parquet_file, bucket_name, s3_key)
+
+            logger.info(f"Uploaded to s3://{bucket_name}/{s3_key}")
+
+            # -----------------------------
+            # CLEANUP LOCAL FILES
             # -----------------------------
             os.remove(local_path)
-            logger.info(f"Deleted local file {file}")
+            os.remove(parquet_file)
+
+            logger.info(f"Deleted local files for {file}")
 
         except Exception as e:
             logger.error(f"Error processing {file}: {str(e)}")
@@ -116,8 +153,8 @@ for file in files:
 # -----------------------------
 # CLOSE CONNECTIONS
 # -----------------------------
-cursor.close()
-conn.close()
+# cursor.close()
+# conn.close()
 sftp.close()
 transport.close()
 
