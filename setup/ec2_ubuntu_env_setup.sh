@@ -34,7 +34,7 @@ systemctl enable mysql
 # -----------------------------
 # Install Python libraries
 # -----------------------------
-pip3 install paramiko pandas pymysql boto3 watchtower --break-system-packages
+pip3 install paramiko pandas pymysql boto3 watchtower pyarrow --break-system-packages
 
 # -----------------------------
 # Create SFTP folder
